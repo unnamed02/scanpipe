@@ -9,11 +9,11 @@
 
 ```
 Redis Stream: paper_<unique_id>_p<page>
-  → 拉取原图（RustFS）
+  → 拉取原图（S3 兼容对象存储）
   → 拉取试卷模板（hyxq，含题目坐标/答案/判题标准）
   → 逐题切图 → 调多模态模型批改（mmfine @ 推理服务器）
   → 画批改标记图（对号/叉号/标准答案标签）
-  → 产出：批改结果消息 + 标记图回写 RustFS
+  → 产出：批改结果消息 + 标记图回写对象存储
 ```
 
 **不做什么**：不做 QR 识别（上游已完成）、不做班级路由（上游已完成）、
@@ -39,7 +39,7 @@ paper_<unique_id>_p<page>     例：paper_95122686091_p6
 | 字段 | 含义 |
 |---|---|
 | `copy_number` | QR 第二位 = studentid（份数即学号，印刷时绑定学生） |
-| `key` | RustFS 对象 key，格式 `paper/<paper_id>/<studentid>/page_<n>.jpg` |
+| `key` | 对象存储 key（S3 兼容：RustFS / MinIO / AWS S3 等），格式 `paper/<paper_id>/<studentid>/page_<n>.jpg` |
 
 ### bucket 推导规则（**必须与此一致**）
 
@@ -57,7 +57,7 @@ paper_<unique_id>_p<page>     例：paper_95122686091_p6
 
 - 消费组名：`graders`；consumer 名：`grader-<host>-<pid>-<n>`
 - 读取：`XREADGROUP GROUP graders <consumer> COUNT 1 BLOCK 5000 STREAMS <stream> >`
-- **ACK 时机：所有副作用完成后**（结果消息发出 + 标记图写回 RustFS 成功）
+- **ACK 时机：所有副作用完成后**（结果消息发出 + 标记图写回对象存储成功）
 - 重投：worker 崩溃/超时未 ACK，由 `XAUTOCLAIM` 接管（见 §6）
 
 ## 3. 输出契约
@@ -99,7 +99,7 @@ paper_<unique_id>_p<page>     例：paper_95122686091_p6
   下游云端同步 worker 直接复用现有 TestPaper 文档组装逻辑
 - `marked_key`：批改标记图（整页，含对号/叉号/标准答案标签）
 
-### 3.2 产物回写（RustFS 三件套）
+### 3.2 产物回写（对象存储三件套）
 
 ```
 bucket：与原图同 bucket
@@ -115,7 +115,7 @@ bucket：与原图同 bucket
 | 依赖 | 地址 | 用途 | 失败处理 |
 |---|---|---|---|
 | Redis | 6379 | 消息收发 | 断线重连（指数退避，上限 30s） |
-| RustFS | 9000 | 拉图/写标记图 | 单次失败不 ACK，等重投 |
+| 对象存储（S3 兼容：RustFS / MinIO 等） | 9000 | 拉图/写标记图 | 单次失败不 ACK，等重投 |
 | mmfine（主模型） | 192.168.0.102:8000 | 逐题看图批改 | 重试 3 次 → failed 消息 |
 | PaddleOCR-VL | 192.168.0.102:8001 | 手写识别兜底 | 降级为仅模型判定 |
 | hyxq | https://hyxq.com.cn | 试卷模板 + 班级信息 | 本地缓存，缓存外失败 → failed |
@@ -132,7 +132,7 @@ MQ 语义是 at-least-once，**同一条消息可能被批改多次**，必须�
 
 | 副作用 | 幂等机制 |
 |---|---|
-| 标记图写 RustFS | 同 key 覆盖写，天然幂等 |
+| 标记图写对象存储 | 同 key 覆盖写，天然幂等 |
 | 结果消息重发 | 下游按 `(paper_id, copy_number, page_number)` UPSERT |
 | 模型调用 | 无状态，重复调用只费钱不脏数据 |
 
@@ -163,7 +163,7 @@ DLQ（`paper_*_p*.dlq`）由 janitor 搬运，人工排查后重新 XADD 回流�
 |---|---|---|
 | `REDIS_ADDR` | 127.0.0.1:6379 | Redis 地址 |
 | `REDIS_PASSWORD` | 空 | |
-| `RUSTFS_ADDR` / `RUSTFS_AK` / `RUSTFS_SK` | — | 对象存储 |
+| `RUSTFS_ADDR` / `RUSTFS_AK` / `RUSTFS_SK` | — | 对象存储（S3 兼容 endpoint，变量名沿用 RustFS） |
 | `MODEL_API_URL` | http://192.168.0.102:8000/v1/chat/completions | 多 URL 逗号分隔可轮询 |
 | `MODEL_NAME` | mmfine-reason-8b | |
 | `PADDLEOCR_VL_BASE_URL` | http://192.168.0.102:8001 | |
@@ -173,9 +173,12 @@ DLQ（`paper_*_p*.dlq`）由 janitor 搬运，人工排查后重新 XADD 回流�
 ## 9. 本地开发
 
 ```bash
-# 依赖：本地 Redis + RustFS（docker compose 一键起，见 scanpipe/README）
+# 依赖：本地 Redis + S3 兼容对象存储（RustFS 或 MinIO，二选一）
 docker run -d --name scanredis -p 6379:6379 redis:7-alpine
 docker run -d --name rustfs -p 9000:9000 -p 9001:9001 rustfs/rustfs:latest
+# 或者：docker run -d --name minio -p 9000:9000 -p 9001:9001 \
+#   -e MINIO_ROOT_USER=admin -e MINIO_ROOT_PASSWORD=password \
+#   minio/minio server /data --console-address ":9001"
 
 # 造一页测试数据：用 scanpipe 的模拟扫描
 python scanpipe/tools/simulate_scan.py http://127.0.0.1:5665 test-001 ../page_1.jpg ../page_2.jpg

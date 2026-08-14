@@ -60,7 +60,7 @@ redis://<redis-host>:6379
 - `copy_number` = 份数字段 = studentid（打包格式 bit 48-54；老格式第 2 段）
 - 物理页码由流名 `paper_<unique_id>_p<n>` 承载（打包格式 bit 0-4；老格式第 4 段。扫描序号不可信）
 - QR 格式见 [QR_FORMAT.md](QR_FORMAT.md)：新格式为 17 位纯数字（56 bit 打包），老格式为逗号分段，分类端两者兼容
-- `key` = RustFS 对象 key；bucket 按统一规则推导：有班级信息 `class-<classId>`，否则 `paper-<paperID>`
+- `key` = 对象存储 key（S3 兼容：RustFS / MinIO / AWS S3 等均可）；bucket 按统一规则推导：有班级信息 `class-<classId>`，否则 `paper-<paperID>`
 - QR 识别失败进 `quarantine` 流（完整消息 + 内联图，供人工处理）
 
 ### essay_pages — 作文整篇（分类器 → 作文批改工人）
@@ -72,7 +72,7 @@ redis://<redis-host>:6379
 {"uuid": "45f8143e-5328-4633-9e59-a2922bba6f88", "keys": ["paper/00139/1/page_5.jpg", "paper/00139/1/page_6.jpg"], "pages_missing": false}
 ```
 
-- `keys` = 该篇全部页的 RustFS 对象 key
+- `keys` = 该篇全部页的对象存储 key
 - 判齐依据试卷模板给出的作文物理页集合（分类器每次登记页时幂等重登），
   不依赖客户端字段；闲置 120s 未齐由兜底 sweep 残缺发出
 - 作文页只参与聚合，不进 `paper_` 流；`paper_` 流承载常规题页
@@ -131,7 +131,7 @@ WS 收到扫描客户端的 `upload_finish` 时，ingest 写入一条：
 | 规则 | 说明 |
 |---|---|
 | 语义 | **at-least-once**。消费者必须幂等（写库 UPSERT、写对象存储同名覆盖） |
-| ACK 时机 | **副作用完成后才 ACK**（写完 RustFS / Postgres / 完成批改并 XADD 结果后） |
+| ACK 时机 | **副作用完成后才 ACK**（写完对象存储 / Postgres / 完成批改并 XADD 结果后） |
 | PEL 超时 | 消息闲置 ≥ 60s 未 ACK → 由其他消费者 `XAUTOCLAIM` 接管（delivery count 自增） |
 | 重投上限 | delivery count ≥ 5 → janitor（scanpipe 内建，30s 周期）搬入死信流 `<stream>.dlq` |
 | DLQ 格式 | `{"_dlq_reason": "max_deliveries(5) from <stream>:<id>", "payload": <原消息 JSON>}`，人工排查后重新 XADD 回流即可重处理 |

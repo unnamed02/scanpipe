@@ -15,7 +15,7 @@ internal/
   classify/   QR 分类工人：raw_pages → gozxing 解码 → paper_<unique_id>_p<页>
               ├ qrpack.go      56 bit 打包格式编解码（规范见 docs/QR_FORMAT.md）
               ├ paper.go       hyxq 试卷模板/班级信息客户端（磁盘缓存）
-              ├ archive.go     原图落 RustFS（class-<id> / paper-<id> bucket）
+              ├ archive.go     原图落对象存储（S3 兼容；class-<id> / paper-<id> bucket）
               └ essaybatch.go  作文批次聚合（Redis BITMAP 判齐，超时残缺兜底）
 ```
 
@@ -33,11 +33,16 @@ go build ./cmd/scanpiped
             -hyxq-token <hyxq token>   # 可选，不配则纯 QR 路由（无班级信息/作文判定）
 ```
 
-可选：配 RustFS 后原图落对象存储，下游消息只剩 `copy_number` + `key` 两个字段：
+可选：配 **S3 兼容对象存储**（RustFS / MinIO / AWS S3 等，minio-go 客户端）后，
+原图落对象存储，下游消息只剩 `copy_number` + `key` 两个字段：
 
 ```bash
 ./scanpiped ... -rustfs-addr <host:9000> -rustfs-ak <ak> -rustfs-sk <sk>
 ```
+
+> 参数名沿用 `-rustfs-*`，实际任何 S3 兼容 endpoint 均可。
+> 当前实现走 HTTP（`Secure: false`）：内网 RustFS / MinIO 直接可用；
+> 接 HTTPS endpoint（如公网 MinIO、AWS S3）需改 `archive.go` 的 `Secure` 选项。
 
 所有参数均可由环境变量提供：`REDIS_ADDR` / `REDIS_PASSWORD` / `HYXQ_URL` /
 `HYXQ_TOKEN` / `RUSTFS_ADDR` / `RUSTFS_AK` / `RUSTFS_SK` / `PAPER_CACHE_DIR`。
@@ -56,7 +61,7 @@ NWBox 扫描仪 ──POST /api/upload──▶ ingest ──XADD──▶ Redis
 
 ## 注意
 
-- 不配 RustFS 时消息内联 base64 原图，单条约 600KB；workers 之间通过消费组天然负载均衡
+- 不配对象存储时消息内联 base64 原图，单条约 600KB；workers 之间通过消费组天然负载均衡
 - 分类器每 worker 独立连接，BLOCK 5s，断线指数退避重连（上限 30s）；
   Redis 重启后无需重启本服务
 - QR 物理页码为准，扫描序号不可信（双面扫描乱序）
