@@ -1,6 +1,6 @@
-# scanmq 协议契约
+# 消息队列协议契约
 
-本文档是 Go broker（scanmq）与 Python 消费端之间的**唯一契约**。
+本文档是 scanpipe（Go）与各消费端（Python 等）之间的**唯一契约**。
 双方各自实现，互不依赖内部细节。改动本文档需要双方确认。
 
 ## 1. 传输协议
@@ -12,75 +12,19 @@ redis://<redis-host>:6379
 ```
 
 消息格式：stream entry 单字段 `p` = payload（JSON 字符串）。
+
 - 入队：`XADD <stream> * p <payload>`
 - 消费：`XREADGROUP GROUP <g> <c> COUNT n BLOCK ms STREAMS <stream> >`
+- 确认：`XACK <stream> <group> <id>`
 - 重投：`XAUTOCLAIM`（接管闲置超期消息，delivery count 由 Redis 自增）
-- 死信：janitor 检查 XPENDING 的 delivery count ≥5 → 搬入 `<stream>.dlq`
+- 死信：janitor 检查 XPENDING 的 delivery count ≥ 5 → 搬入 `<stream>.dlq`
 
-与真实 Redis 的**差异点**（redis-py 不会校验，但语义以本文档为准）：
+语义即标准 Redis Streams，无 broker 侧定制；redis-py / go-redis 等任意
+客户端直连即可。消息 ID 为 Redis 标准 `ms-seq` 格式（如 `1722156789123-0`）。
 
-- 消息 ID 是 **uint64 offset 的十进制字符串**（如 `"10485"`），不是 Redis 的 `ms-seq` 格式
-- `MQADD` 简化为单 payload：`MQADD <stream> <payload>`，返回 ID 字符串
-- payload 即完整消息体（JSON 字符串或二进制），不做 field-value 拆分
+## 2. 流与消息 Schema
 
-## 2. 命令子集
-
-### MQADD — 入队
-
-```
-MQADD <stream> <payload>
-→ 返回: "10485"  (消息 ID，单调递增)
-```
-
-### MQREAD — 消费组读取
-
-```
-MQREAD <stream> <group> <consumer> [COUNT n] [BLOCK ms]
-→ 返回: [[id, payload], ...]  （至多 n 条新消息）
-```
-
-语义：
-
-- 每条流按 group 记录 `last_delivered` 偏移；读 `>` 即返回其后的新消息
-- 投递即入 PEL（Pending Entries List），consumer 记名
-- `BLOCK ms`：无新消息时连接挂起等待，任一流有新消息或超时即返回（超时返回空数组）。唤醒精度为毫秒级；推荐消费者统一使用 `BLOCK 5000` 代替轮询
-
-### MQACK — 确认
-
-```
-MQACK <stream> <group> <id>
-→ 返回: 1 (从 PEL 移除) / 0 (不在 PEL)
-```
-
-### MQSTATS — 队列指标
-
-```
-MQSTATS [stream]
-→ 返回: [[stream, depth, [[group, next_offset, lag, pel_size], ...]], ...]
-```
-
-### AUTH — 认证（broker 以 -auth 启动时）
-
-```
-AUTH <token>  → "OK"（连接级，每个连接认证一次；redis-py 用 password= 参数自动完成）
-```
-
-### MQPENDING — 查看未确认
-
-```
-MQPENDING <stream> <group>
-→ 返回: [[id, consumer, deliver_unix_ms, attempts], ...]
-```
-
-### PING
-
-```
-PING → "PONG"
-```
-
-## 3. 流与消息 Schema
-
-三条流，全部 JSON payload（UTF-8）：
+全部 JSON payload（UTF-8）：
 
 ### raw_pages — 扫描原始页（ingest → 分类工人）
 
@@ -102,7 +46,7 @@ PING → "PONG"
 ```
 
 - `uuid` = 一次扫描批次；`uuid + page_number` 全局唯一标识一页
-- `image` 内联在消息里（不落盘设计的核心）；MD5 针对解码后字节
+- `image` 内联在消息里；MD5 针对解码后字节
 
 ### paper_<unique_id>_p<page> — 常规题已分类页（分类器 → 批改工人）
 
@@ -122,14 +66,15 @@ PING → "PONG"
 ### essay_pages — 作文整篇（分类器 → 作文批改工人）
 
 作文是**一条流**。分类器按扫描批次 uuid 聚合作文页，**整篇拼接完整之后再发**；
-超时未齐也发出（`pages_missing=true` 标记残缺）：
+闲置超时未齐也发出（`pages_missing=true` 标记残缺）：
 
 ```json
 {"uuid": "45f8143e-5328-4633-9e59-a2922bba6f88", "keys": ["paper/00139/1/page_5.jpg", "paper/00139/1/page_6.jpg"], "pages_missing": false}
 ```
 
-- `keys` = 该篇全部页的 RustFS 对象 key，按扫描序排列
-- 应到页数以 `batch_events` 的 `upload_finish`（total_pages）为准；finish 只记页数，攒满才发
+- `keys` = 该篇全部页的 RustFS 对象 key
+- 判齐依据试卷模板给出的作文物理页集合（分类器每次登记页时幂等重登），
+  不依赖客户端字段；闲置 120s 未齐由兜底 sweep 残缺发出
 - 作文页只参与聚合，不进 `paper_` 流；`paper_` 流承载常规题页
 
 ### grading_results — 批改结果（批改工人 → 写库工人 + 云端同步工人）
@@ -138,7 +83,7 @@ PING → "PONG"
 {
   "type": "grading_result",
   "schema": 1,
-  "ref_msg_id": "10512",
+  "ref_msg_id": "1722156789123-0",
   "uuid": "45f8143e-5328-4633-9e59-a2922bba6f88",
   "class_id": "初三2班",
   "archive_prefix": "初三2班/2026-07-27/",
@@ -181,24 +126,23 @@ WS 收到扫描客户端的 `upload_finish` 时，ingest 写入一条：
 }
 ```
 
-## 4. 可靠性与 ACK 规则
+## 3. 可靠性与 ACK 规则
 
 | 规则 | 说明 |
 |---|---|
 | 语义 | **at-least-once**。消费者必须幂等（写库 UPSERT、写对象存储同名覆盖） |
 | ACK 时机 | **副作用完成后才 ACK**（写完 RustFS / Postgres / 完成批改并 XADD 结果后） |
-| PEL 超时 | 消息超时未 ACK（`-pel-timeout`，默认 300s）→ 下次 MQREAD 自动重投（attempts+1，换新消费者名下） |
-| 重投上限 | attempts ≥ `-max-attempts`（默认 5）且已超时 → sweeper 移入死信流 `<stream>.dlq`；JSON 消息原样注入 `_dlq_reason`，非 JSON 用信封包装（`payload_base64`） |
-| 重投时机 | 补在新消息之后：MQREAD 先发新消息，不足 COUNT 时才补发 PEL 超时消息 |
-| 段 GC | sweeper 周期（`-sweep-interval`）整段删除：水位 = min(各组待投递偏移, PEL 消息 ID)；**无消费组的流水位锁死，不删** |
-| 崩溃恢复 | broker 重启后消息（段日志）与 PEL（Pebble）全量保留，未 ACK 消息按超时规则重投 |
+| PEL 超时 | 消息闲置 ≥ 60s 未 ACK → 由其他消费者 `XAUTOCLAIM` 接管（delivery count 自增） |
+| 重投上限 | delivery count ≥ 5 → janitor（scanpipe 内建，30s 周期）搬入死信流 `<stream>.dlq` |
+| DLQ 格式 | `{"_dlq_reason": "max_deliveries(5) from <stream>:<id>", "payload": <原消息 JSON>}`，人工排查后重新 XADD 回流即可重处理 |
+| 崩溃恢复 | Redis 持久化（AOF/RDB）保留流与 PEL，未 ACK 消息按闲置规则被接管重投 |
 
-## 5. 背压
+## 4. 背压
 
-- broker 内存水位：堆中未落盘消息 > 2GB → MQADD 返回 `ERR backpressure`，生产者退避重试
+- Redis 侧：配置 `maxmemory` + 合适的淘汰策略，监控各流长度；生产者遇到 OOM 错误退避重试
 - 消费者 prefetch=1（批改）/~8（归档、写库等轻量工人）
 
-## 6. 顺序性
+## 5. 顺序性
 
-- 单流严格 FIFO；跨流不保证（classified_pages 与 grading_results 之间无顺序承诺）
+- 单流严格 FIFO；跨流不保证（`paper_*` 与 `grading_results` 之间无顺序承诺）
 - 同一页的图与结果配对**不依赖 MQ 顺序**，靠 `uuid + page_number` 在 Postgres 里关联
